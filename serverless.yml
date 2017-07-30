@@ -1,0 +1,75 @@
+frameworkVersion: ">=1.2.0 <2.0.0"
+
+service: tenula-bot # NOTE: update this with your service name
+
+provider:
+  name: aws
+  runtime: nodejs6.10
+  profile: weatherstation
+  region: eu-west-1
+  cfLogs: true
+  environment:
+    # Common
+    SERVERLESS_STAGE: ${opt:stage, self:provider.stage}
+    SERVERLESS_PROJECT: ${self:service}
+    SERVERLESS_REGION: ${opt:region, self:provider.region}
+    TABLE_NAME: ${self:provider.environment.SERVERLESS_PROJECT}-${self:provider.environment.SERVERLESS_STAGE}
+    SENSORS_API: ${file(./.env.yml):${self:provider.environment.SERVERLESS_STAGE}.sensors-api}
+
+    # Secrets
+    MS_BOT_CLIENT_ID: ${self:custom.kmsSecrets.secrets.MS_BOT_CLIENT_ID}
+    MS_BOT_CLIENT_SECRET: ${self:custom.kmsSecrets.secrets.MS_BOT_CLIENT_SECRET}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+      - dynamodb:*
+      Resource: arn:aws:dynamodb:${self:provider.environment.SERVERLESS_REGION}:*:*
+    - Effect: Allow
+      Action:
+      - SNS:*
+      Resource: arn:aws:sns:${self:provider.environment.SERVERLESS_REGION}:*:*
+    - Effect: Allow
+      Action:
+      - KMS:Decrypt
+      Resource: ${self:custom.kmsSecrets.keyArn}
+package:
+  exclude:
+    - test/**
+    - .git/**
+
+functions:
+  messages:
+    handler: messages/index.handler
+    events:
+      - http:
+          path: messages
+          method: post
+
+plugins:
+  - serverless-mocha-plugin
+  - serverless-webpack
+  - serverless-offline
+  - serverless-kms-secrets
+
+custom:
+  serverless-mocha-plugin:
+    functionTemplate: templates/function.ejs
+  webpackIncludeModules: true
+  kmsSecrets: ${file(kms-secrets.${opt:stage, self:provider.stage}.${opt:region, self:provider.region}.yml)}
+
+#resources:
+#  Resources:
+#    SessionsTable:
+#      Type: AWS::DynamoDB::Table
+#      DeletionPolicy: Delete
+#      Properties:
+#        AttributeDefinitions:
+#          - AttributeName: id
+#            AttributeType: S
+#        KeySchema:
+#          - AttributeName: id
+#            KeyType: HASH
+#        ProvisionedThroughput:
+#          ReadCapacityUnits: 1
+#          WriteCapacityUnits: 1
+#        TableName: ${self:provider.environment.TABLE_NAME}
