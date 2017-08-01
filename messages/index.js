@@ -5,28 +5,74 @@ const moment = require('moment');
 const _ = require('lodash');
 const { decrypt } = require('../shared/secrets');
 const log = require('../shared/log');
+const AWS = require('aws-sdk');
 
-const authenticate = () =>
-  decrypt([process.env.MS_BOT_CLIENT_ID, process.env.MS_BOT_CLIENT_SECRET])
-    .then(([clientId, clientSecret]) => {
-      const params = {
-        grant_type: 'client_credentials',
-        client_id: clientId,
-        client_secret: clientSecret,
-        scope: 'https://api.botframework.com/.default',
-      };
+const dynamodb = new AWS.DynamoDB.DocumentClient({
+  region: AWS.config.region || process.env.SERVERLESS_REGION || 'us-east-1',
+});
 
-      const searchParams = Object.keys(params).map((key) =>
-        `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`).join('&');
+const lambda = new AWS.Lambda({
+  region: AWS.config.region || process.env.SERVERLESS_REGION || 'us-east-1',
+});
 
-      return fetch('https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token',
-        { method: 'POST',
-          body: searchParams,
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-        });
-    }).then(res => res.json());
+const insertAuthenticationToken = ({ access_token: token }) => {
+  const Item = Object.assign({ created: Date.now(), id: 'token', token });
+  const params =
+    Object.assign(
+      { TableName: process.env.AUTHENTICATION_TABLE_NAME },
+      { Item });
+  return dynamodb
+    .put(params).promise()
+    .then(() => ({ token }));
+};
+
+const getAuthenticationToken = () => {
+  const params = {
+    TableName: process.env.AUTHENTICATION_TABLE_NAME,
+    KeyConditionExpression: '#id = :token',
+    ExpressionAttributeNames: {
+      '#id': 'id',
+    },
+    ExpressionAttributeValues: {
+      ':token': 'token',
+    },
+  };
+
+  return dynamodb.query(params).promise()
+    .then(({ Items }) => {
+      const { token } = Items[0];
+      return { token };
+    })
+    .catch(() => ({ token: '' }));
+};
+
+const authenticate = (expired) => {
+  if (expired === true) {
+    return decrypt([process.env.MS_BOT_CLIENT_ID, process.env.MS_BOT_CLIENT_SECRET])
+      .then(([clientId, clientSecret]) => {
+        const params = {
+          grant_type: 'client_credentials',
+          client_id: clientId,
+          client_secret: clientSecret,
+          scope: 'https://api.botframework.com/.default',
+        };
+
+        const searchParams = Object.keys(params).map((key) =>
+          `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`).join('&');
+
+        return fetch('https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token',
+          { method: 'POST',
+            body: searchParams,
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+          });
+      }).then(res => res.json())
+      .then(insertAuthenticationToken);
+  }
+
+  return getAuthenticationToken();
+};
 
 const sendReply = ({ serviceUrl, token, payload }) => {
   if (payload.text) {
@@ -42,33 +88,40 @@ const sendReply = ({ serviceUrl, token, payload }) => {
     });
   }
 
-  return Promise.resolve('');
-};
-
-const getCurrent = (deviceId) =>
-  fetch(`${process.env.SENSORS_API}/data/${deviceId}/current`)
-    .then(res => res.json());
-
-const route = (message) => {
-  if (/^\/current.*/.test(message.text)) {
-    return Promise.all([
-      getCurrent('b764034949e0c8643f09689666669b8c'),
-      getCurrent('b8f82803b0d69415ef92a36519fb1d81'),
-    ]).then(devices => devices.map((device) => {
-      const time = moment(device.timestamp).calendar();
-      const temperature = _.find(device.sensors, { type: 'temperature' });
-      const absolutePressure = _.find(device.sensors, { type: 'absolutepressure' });
-      const seaLevelPressure = _.find(device.sensors, { type: 'seaLevelPressure' });
-      // @todo templates
-      return `**${device.name} ${time}**\n\nTemp: ${Math.round(temperature.value * 100) / 100}°C\n\nAbs. pressure: ${Math.round(absolutePressure.value * 100) / 100} hPa\n\nSea level pressure: ${Math.round(seaLevelPressure.value * 100) / 100} hPa`;
-    }).join('\n\n---\n\n'));
-  } else if (/^\/sensors.*/.test(message.text)) {
-    return Promise.resolve(String.fromCodePoint(128528));
-  }
   return Promise.resolve(null);
 };
 
+const getCurrent = (location) =>
+  fetch(`${process.env.SENSORS_API}/locations/${location}/latest`)
+    .then(res => res.json());
+
+const route = (message) => {
+  const query =
+    message.channelId === 'telegram' &&
+    message.channelData.inline_query &&
+    message.channelData.inline_query.query
+      ? message.channelData.inline_query.query.replace('-', '/')
+      : '';
+
+  const text = message.text || query;
+  if (/^\/current.*/.test(text)) {
+    return getCurrent('tenula')
+      .then(devices => devices.map((device) => {
+        const time = moment(device.timestamp).utcOffset(3).calendar();
+        const temperature = _.find(device.sensors, { type: 'temperature' });
+        const absolutePressure = _.find(device.sensors, { type: 'absolutePressure' });
+        const seaLevelPressure = _.find(device.sensors, { type: 'seaLevelPressure' });
+        // @todo templates
+        return `**${device.name} ${time}**\n\nTemp: ${Math.round(temperature.value * 100) / 100}°C\n\nAbs. pressure: ${Math.round(absolutePressure.value * 100) / 100} hPa\n\nSea level pressure: ${Math.round(seaLevelPressure.value * 100) / 100} hPa`;
+      }).join('\n\n---\n\n'));
+  } else if (/^\/sensors.*/.test(text)) {
+    return Promise.resolve(String.fromCodePoint(128528));
+  }
+  return Promise.resolve('/current for latest sensor readings');
+};
+
 module.exports.handler = (event, context, callback) => {
+  log(event, context);
   const message = JSON.parse(event.body);
   const response = {
     statusCode: 200,
@@ -95,8 +148,9 @@ module.exports.handler = (event, context, callback) => {
     text: '',
     replyToId: message.id,
   };
-  return authenticate()
-    .then(({ access_token: token }) =>
+
+  return authenticate(event.expired)
+    .then(({ token }) =>
       route(message)
         .then(data => ({
           serviceUrl: message.serviceUrl,
@@ -104,6 +158,18 @@ module.exports.handler = (event, context, callback) => {
           payload: Object.assign({}, replyPayload, { text: data }),
         })))
     .then(sendReply)
+    .then(res => {
+      log('sendReply status', res.status);
+      if (res.status !== 200 && !event.expired) {
+        return lambda.invoke({
+          FunctionName: context.functionName,
+          InvocationType: 'Event',
+          Payload: JSON.stringify(Object.assign({ expired: true }, event)),
+        }).promise();
+      }
+
+      return Promise.resolve();
+    })
     .then(() => callback(null, response))
     .catch(error =>
       log(error)
